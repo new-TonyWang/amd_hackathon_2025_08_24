@@ -1,0 +1,66 @@
+From f535ca4e1e256764010154fb9a9caed13573206d Mon Sep 17 00:00:00 2001
+From: wangtongyu <wangtongyu@sii.edu.cn>
+Date: Sun, 24 Aug 2025 08:29:16 +0000
+Subject: [PATCH] modify sampling
+
+---
+ vllm/v1/sample/ops/topk_topp_sampler.py | 39 ++++++++++++++-----------
+ 1 file changed, 22 insertions(+), 17 deletions(-)
+
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 7bd4a5a38..dd01032c8 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -191,27 +191,32 @@ def apply_top_k_top_p(
+         # Avoid sorting vocab for top-k only case.
+         return apply_top_k_only(logits, k)
+ 
+-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
++    probs = logits.softmax(dim=-1)
++    probs_sort, _ = probs.sort(dim=-1, descending=False)
+ 
+     if k is not None:
+-        # Apply top-k.
+-        top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
+-        # Get all the top_k values.
+-        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+-        top_k_mask = logits_sort < top_k_mask
+-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
++        top_k_count = probs_sort.size(1) - k.to(
++            torch.long)  # shape: (batch, )
++        top_k_count = top_k_count.unsqueeze(dim=1)
++        top_k_cutoff = probs_sort.gather(-1, top_k_count)
++
++        # Make sure the no top-k rows are no-op.
++        no_top_k_mask = (k == logits.shape[1]).unsqueeze(dim=1)
++        top_k_cutoff.masked_fill_(no_top_k_mask, -float("inf"))
++
++        elements_to_discard = probs < top_k_cutoff
++        logits.masked_fill_(elements_to_discard, -float("inf"))
+ 
+     if p is not None:
+-        # Apply top-p.
+-        probs_sort = logits_sort.softmax(dim=-1)
+-        probs_sum = torch.cumsum(probs_sort, dim=-1, out=probs_sort)
+-        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+-        # at least one
+-        top_p_mask[:, -1] = False
+-        logits_sort.masked_fill_(top_p_mask, -float("inf"))
+-
+-    # Re-sort the probabilities.
+-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
++        cumprob = torch.cumsum(probs_sort, dim=-1)
++        top_p_mask = cumprob <= 1 - p.unsqueeze(dim=1)
++        top_p_mask[:, -1] = False  # at least one
++
++        top_p_count = top_p_mask.sum(dim=-1).unsqueeze(1)
++        top_p_cutoff = probs_sort.gather(-1, top_p_count)
++        elements_to_discard = probs < top_p_cutoff
++        logits.masked_fill_(elements_to_discard, -float("inf"))
++
+     return logits
+ 
+ 
+-- 
+2.34.1
+
